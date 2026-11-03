@@ -35,3 +35,28 @@ def test_invalid_counts_rejected(k, n, message):
 def test_shape_mismatch_rejected():
     with pytest.raises(ValueError, match="shape"):
         CountSet(np.zeros((3, 3)), np.zeros(2, dtype=int), np.ones(2, dtype=int))
+
+
+def test_merge_sums_counts_at_shared_positions():
+    from countfield import merge_by_position
+
+    x = np.array([[0.0, 0, 0], [1, 0, 0], [0, 0, 1e-9], [2, 0, 0]])
+    data = CountSet(x, np.array([1, 2, 3, 4]), np.array([10, 20, 30, 40]))
+    merged, multiplicity = merge_by_position(data, decimals=6)
+    assert len(merged) == 3
+    np.testing.assert_array_equal(merged.k, [4, 2, 4])
+    np.testing.assert_array_equal(merged.n, [40, 20, 40])
+    np.testing.assert_array_equal(multiplicity, [2, 1, 1])
+
+
+def test_groups_roundtrip(tmp_path):
+    from countfield import load_groups, save_groups
+    from countfield.data import shared_positions
+
+    a, b = _synthetic(0, 10), _synthetic(1, 5)
+    save_groups(tmp_path / "c.npz", {"train/lf": a, "val/hf": b})
+    groups = load_groups(tmp_path / "c.npz")
+    assert list(groups) == ["train/lf", "val/hf"]
+    np.testing.assert_array_equal(groups["val/hf"].k, b.k)
+    assert shared_positions(a, b, 6) == 0
+    assert shared_positions(a, a.subset(np.arange(3)), 6) == 3

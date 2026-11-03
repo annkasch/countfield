@@ -9,6 +9,7 @@ description = "Neural-process interpolation of continuous fields from sparse bin
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
+    "scipy",
     "torch",
     "pydantic>=2",
     "pyyaml",
