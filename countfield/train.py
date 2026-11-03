@@ -39,7 +39,7 @@ from countfield.data import (
 )
 from countfield.likelihood import log_marginal
 from countfield.model import LocalLatentNP, NeighbourInputs, Standardization
-from countfield.scoring import predictive_summary, score
+from countfield.scoring import grid_log_mass, predictive_summary, predictive_summary_grid, score
 
 
 def _stream(seed: int, k: int) -> np.random.Generator:
@@ -242,9 +242,8 @@ def run(config: RunConfig, log=print) -> Path:
     metrics = []
     for g in config.data.evaluation:
         data = groups[g]
-        mu, sigma = latents[g]
-        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
-        row = dict(group=g, **score(data, mu, sigma, summary, config.model.quadrature_nodes))
+        row, arrays = _evaluate(data, latents[g], config)
+        row = dict(group=g, **row)
         metrics.append(row)
         log(f"{g}: NLL {row['predictive_nll']:.4f}, coverage {row['coverage']}")
         np.savez_compressed(
@@ -253,9 +252,7 @@ def run(config: RunConfig, log=print) -> Path:
             hits=data.k,
             target_events=data.n,
             observed=data.fraction,
-            latent_mu=mu,
-            latent_sigma=sigma,
-            **summary,
+            **arrays,
         )
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False))
     from countfield.plots import plot_run
@@ -264,8 +261,21 @@ def run(config: RunConfig, log=print) -> Path:
     return out
 
 
+def _evaluate(data: CountSet, prediction, config: RunConfig) -> tuple[dict, dict]:
+    """Metrics and arrays of one evaluation set from (mu, sigma) or a probability grid."""
+    if isinstance(prediction, tuple):
+        mu, sigma = prediction
+        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
+        row = score(data, mu, sigma, summary, config.model.quadrature_nodes)
+        return row, dict(latent_mu=mu, latent_sigma=sigma, **summary)
+    grid = np.asarray(prediction)  # [Q, G]
+    summary = predictive_summary_grid(grid, data.n, k=data.k)
+    row = score(data, None, None, summary, log_mass=grid_log_mass(grid, data.k, data.n))
+    return row, dict(p_grid=grid, **summary)
+
+
 def rescore(directory: str | Path) -> list[dict]:
-    """Recompute metrics.json and plots of a finished run from its saved latent mu/sigma."""
+    """Recompute metrics.json and plots of a finished run from its saved predictions."""
     from countfield.config import RunConfig
     from countfield.plots import plot_run
 
@@ -277,12 +287,14 @@ def rescore(directory: str | Path) -> list[dict]:
         with np.load(path) as f:
             arrays = {key: f[key] for key in f.files}
         data = CountSet(arrays["x"], arrays["hits"], arrays["target_events"])
-        mu, sigma = arrays["latent_mu"], arrays["latent_sigma"]
-        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
-        metrics.append(
-            dict(group=g, **score(data, mu, sigma, summary, config.model.quadrature_nodes))
+        prediction = (
+            arrays["p_grid"]
+            if "p_grid" in arrays
+            else (arrays["latent_mu"], arrays["latent_sigma"])
         )
-        np.savez_compressed(path, **{**arrays, **summary})
+        row, new = _evaluate(data, prediction, config)
+        metrics.append(dict(group=g, **row))
+        np.savez_compressed(path, **{**arrays, **new})
     (directory / "metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False))
     plot_run(directory)
     return metrics

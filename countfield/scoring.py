@@ -20,7 +20,7 @@ from scipy.special import expit
 from scipy.stats import rankdata
 
 from countfield.data import CountSet
-from countfield.likelihood import central_interval, latent_grid, log_marginal, predictive_pmf
+from countfield.likelihood import central_interval, latent_grid, log_marginal
 
 LEVELS = {1: 0.682689492, 2: 0.954499736, 3: 0.997300204}
 
@@ -33,7 +33,17 @@ def predictive_summary(
     k: np.ndarray | None = None,  # [Q] observed counts, for the CRPS
 ) -> dict[str, np.ndarray]:
     """Moments, median and central intervals of the predicted fraction k/n (and CRPS)."""
-    q = len(mu)
+    p_grid = np.stack([expit(latent_grid(mu[i], sigma[i], grid)) for i in range(len(mu))])
+    return predictive_summary_grid(p_grid, n, k)
+
+
+def predictive_summary_grid(
+    p_grid: np.ndarray,  # [Q, G] equally weighted draws (quantiles) of the hit probability
+    n: np.ndarray,  # [Q] trials at the queries
+    k: np.ndarray | None = None,  # [Q] observed counts, for the CRPS
+) -> dict[str, np.ndarray]:
+    """As predictive_summary for a predictive distribution of p given as equal-weight draws."""
+    q = len(p_grid)
     out = {
         key: np.empty(q)
         for key in ("mean", "sigma", "median", "probability_mean", "probability_sd")
@@ -43,12 +53,12 @@ def predictive_summary(
     if k is not None:
         out["crps"] = np.empty(q)
     for i in range(q):
-        p = expit(latent_grid(mu[i], sigma[i], grid))
+        p = p_grid[i]
         out["probability_mean"][i], out["probability_sd"][i] = p.mean(), p.std()
         # k/n: E = E[p]; Var = E[p(1-p)]/n + Var[p].
         out["mean"][i] = p.mean()
         out["sigma"][i] = np.sqrt((p * (1 - p)).mean() / n[i] + p.var())
-        pmf = predictive_pmf(mu[i], sigma[i], int(n[i]), grid)
+        pmf = mixture_pmf(p, int(n[i]))
         cdf = np.cumsum(pmf)
         out["median"][i] = int(np.searchsorted(cdf, 0.5)) / n[i]
         for level, probability in LEVELS.items():
@@ -63,6 +73,23 @@ def predictive_summary(
     return out
 
 
+def mixture_pmf(p: np.ndarray, n: int) -> np.ndarray:
+    """P(k), k = 0..K, of Binomial(n, p) mixed over equal-weight draws p [G]."""
+    from scipy.stats import binom
+
+    k_max = int(min(n, binom.ppf(1 - 1e-9, n, p.max())))
+    return binom.pmf(np.arange(k_max + 1)[None, :], n, p[:, None]).mean(axis=0)
+
+
+def grid_log_mass(p_grid: np.ndarray, k: np.ndarray, n: np.ndarray) -> np.ndarray:  # [Q]
+    """log P(k) of the binomial mixed over the equal-weight draws of each row of p_grid."""
+    from scipy.special import logsumexp
+    from scipy.stats import binom
+
+    log_pmf = binom.logpmf(k[:, None], n[:, None], p_grid)  # [Q, G]
+    return logsumexp(log_pmf, axis=1) - np.log(p_grid.shape[1])
+
+
 def _correlation(a: np.ndarray, b: np.ndarray) -> float | None:
     if len(a) < 2 or np.ptp(a) == 0 or np.ptp(b) == 0:
         return None
@@ -75,8 +102,11 @@ def score(
     sigma: np.ndarray,  # [Q]
     summary: dict[str, np.ndarray],
     nodes: int = 20,
+    log_mass: np.ndarray | None = None,  # [Q] if given, replaces the logit-normal count NLL
 ) -> dict:
-    """All held-out metrics of one evaluation group; `summary` from predictive_summary(k=...)."""
+    """All held-out metrics of one evaluation group; `summary` from predictive_summary(k=...).
+
+    mu/sigma may be None when `log_mass` is given (predictions as probability draws)."""
     y = data.fraction
     p = summary["mean"]
     residual = p - y
@@ -85,14 +115,15 @@ def score(
         if np.ptp(p) == 0
         else float(np.dot(p - p.mean(), y - y.mean()) / np.sum((p - p.mean()) ** 2))
     )
-    with torch.no_grad():
-        log_mass = log_marginal(
-            torch.as_tensor(data.k, dtype=torch.float64),
-            torch.as_tensor(data.n, dtype=torch.float64),
-            torch.as_tensor(mu, dtype=torch.float64),
-            torch.as_tensor(sigma, dtype=torch.float64),
-            nodes,
-        ).numpy()
+    if log_mass is None:
+        with torch.no_grad():
+            log_mass = log_marginal(
+                torch.as_tensor(data.k, dtype=torch.float64),
+                torch.as_tensor(data.n, dtype=torch.float64),
+                torch.as_tensor(mu, dtype=torch.float64),
+                torch.as_tensor(sigma, dtype=torch.float64),
+                nodes,
+            ).numpy()
 
     details, weighted = {}, []
     for level in LEVELS:
@@ -142,7 +173,7 @@ def score(
         z_std=float(z.std(ddof=1)) if len(z) > 1 else 0.0,
         z_outside_2=float(np.mean(np.abs(z) > 2)),
         mse_denoised=float(np.mean(residual**2 - noise)),
-        latent_sigma_median=float(np.median(sigma)),
+        latent_sigma_median=None if sigma is None else float(np.median(sigma)),
     )
     if "crps" in summary:
         result["crps"] = float(summary["crps"].mean())

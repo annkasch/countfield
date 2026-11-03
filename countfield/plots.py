@@ -42,15 +42,29 @@ def _finish(fig, ax, path: Path, title: str, xlabel: str, ylabel: str) -> None:
 
 
 def plot_history(history: list[dict], path: Path) -> None:
+    """Training loss and holdout count NLL; separate panels when they are different measures
+    (photon or masked training loss vs holdout count NLL)."""
     rows = [h for h in history if "step" in h]
     selected = next((h["selected_step"] for h in history if "selected_step" in h), None)
     steps = [h["step"] for h in rows]
-    fig, ax = _axes()
-    for (key, label), color in zip(
-        (("train_nll", "training (leave-one-out)"), ("holdout_nll", "holdout")),
-        SERIES,
-        strict=True,
-    ):
+    same_measure = "train_nll" in rows[0]
+    train_key = "train_nll" if same_measure else "train_loss"
+    if same_measure:
+        fig, ax = _axes()
+        axes = [ax, ax]
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True, facecolor=SURFACE)
+        for ax in axes:
+            ax.set_facecolor(SURFACE)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color(AXIS)
+            ax.tick_params(colors=MUTED, labelcolor=SECONDARY)
+            ax.grid(True, color=GRID, linewidth=0.6)
+            ax.set_axisbelow(True)
+    labels = (("training (leave-one-out)" if same_measure else "training loss"), "holdout")
+    for ax, key, label, color in zip(axes, (train_key, "holdout_nll"), labels, SERIES, strict=True):
         values = [h[key] for h in rows]
         ax.plot(steps, values, color=color, linewidth=2, label=label)
         ax.annotate(
@@ -62,19 +76,25 @@ def plot_history(history: list[dict], path: Path) -> None:
             va="center",
             fontsize=8,
         )
+        if selected is not None:
+            ax.axvline(selected, color=MUTED, linewidth=1, linestyle="--")
+        ax.margins(x=0.12)
     if selected is not None:
-        ax.axvline(selected, color=MUTED, linewidth=1, linestyle="--")
-        ax.annotate(
+        axes[0].annotate(
             f"selected step {selected}",
-            (selected, ax.get_ylim()[1]),
+            (selected, axes[0].get_ylim()[1]),
             xytext=(4, -12),
             textcoords="offset points",
             color=SECONDARY,
             fontsize=8,
         )
-    ax.legend(frameon=False, labelcolor=SECONDARY, fontsize=8)
-    ax.margins(x=0.12)
-    _finish(fig, ax, path, "Count NLL per point during training", "step", "count NLL")
+    if same_measure:
+        axes[0].legend(frameon=False, labelcolor=SECONDARY, fontsize=8)
+        _finish(fig, axes[0], path, "Count NLL per point during training", "step", "count NLL")
+    else:
+        axes[0].set_ylabel("training loss", color=SECONDARY)
+        axes[1].set_ylabel("holdout count NLL", color=SECONDARY)
+        _finish(fig, axes[1], path, "", "step", "holdout count NLL")
 
 
 TARGET = {1: 0.6827, 2: 0.9545, 3: 0.9973}

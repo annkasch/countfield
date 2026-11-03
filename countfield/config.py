@@ -74,6 +74,39 @@ class PointTransformerConfig(_Strict):
     eval_misses_per_point: int | None = Field(
         None, ge=1, description="as misses_per_point for holdout/evaluation passes; null = all"
     )
+    point_features: Literal["photons", "counts"] = Field(
+        "photons", description="visible point feature: photon-set encoder or counts (ablation)"
+    )
+    loss: Literal["voxel", "photon"] = Field(
+        "voxel",
+        description="voxel: binomial count likelihood of masked points; photon: Bernoulli "
+        "likelihood of every photon of masked points with a photon head (voxel probability = "
+        "mean over photons)",
+    )
+    prediction_photons: int = Field(
+        1024, ge=16, description="photon loss: donor photons per query for voxel predictions"
+    )
+    dropout: float = Field(0.0, ge=0, lt=1, description="dropout in PT blocks and photon head")
+    mask_fraction_max: float | None = Field(
+        None,
+        gt=0,
+        lt=1,
+        description="if set, the masked share is uniform in "
+        "[mask_fraction, mask_fraction_max] per step",
+    )
+    keep_fraction_min: float = Field(
+        1.0,
+        gt=0,
+        le=1,
+        description="graph thinning: each step keeps a uniform random share "
+        "in [keep_fraction_min, 1] of the training points and rebuilds the neighbourhoods",
+    )
+
+    @model_validator(mode="after")
+    def _mask_range(self) -> PointTransformerConfig:
+        if self.mask_fraction_max is not None and self.mask_fraction_max < self.mask_fraction:
+            raise ValueError("mask_fraction_max must be >= mask_fraction")
+        return self
 
 
 ModelConfig = Annotated[LocalLatentConfig | PointTransformerConfig, Field(discriminator="kind")]

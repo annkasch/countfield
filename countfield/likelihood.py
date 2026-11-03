@@ -77,3 +77,46 @@ def central_interval(pmf: np.ndarray, probability: float) -> tuple[int, int]:
     lower = int(np.searchsorted(cdf, (1 - probability) / 2))
     upper = int(np.searchsorted(cdf, (1 + probability) / 2))
     return lower, min(upper, len(pmf) - 1)
+
+
+def photon_log_marginal(
+    base: torch.Tensor,  # [P] per-photon logit without the shared latent (mu_j + s_ij)
+    hit: torch.Tensor,  # [P] 0/1
+    weight: torch.Tensor,  # [P] subsampling weights (1 for hits)
+    owner: torch.Tensor,  # [P] target index 0..T-1 of each photon
+    sigma: torch.Tensor,  # [T] sd of the shared latent eps_j
+    nodes: int = 20,
+    newton: int = 6,
+) -> torch.Tensor:  # [T]
+    """log ∫ prod_i Bernoulli(hit_i | sigmoid(base_i + eps))^w_i N(eps; 0, sigma^2) d eps.
+
+    Adaptive Gauss-Hermite: the nodes are centred on the posterior mode of eps (a few Newton
+    steps, no gradient) with the Laplace width; the estimate stays a quadrature of the same
+    integral, so the centring does not bias it. Weighted misses give an unbiased estimate of
+    the log-likelihood sum at each node.
+    """
+    t = len(sigma)
+    dtype = base.dtype
+    with torch.no_grad():
+        m = torch.zeros(t, dtype=dtype)
+        for _ in range(newton + 1):
+            p = torch.sigmoid(base + m[owner])
+            curvature = torch.zeros(t, dtype=dtype).index_add(0, owner, weight * p * (1 - p))
+            curvature = curvature + sigma.pow(-2)
+            if _ == newton:
+                break
+            grad = torch.zeros(t, dtype=dtype).index_add(0, owner, weight * (hit - p))
+            m = m + (grad - m * sigma.pow(-2)) / curvature
+        s = curvature.rsqrt()
+    x, w = np.polynomial.hermite.hermgauss(nodes)
+    x = torch.as_tensor(x, dtype=dtype)
+    log_w = torch.as_tensor(np.log(w / math.sqrt(math.pi)), dtype=dtype)
+    eps = m.unsqueeze(-1) + math.sqrt(2.0) * s.unsqueeze(-1) * x  # [T, Q]
+    eta = base.unsqueeze(-1) + eps[owner]  # [P, Q]
+    ll = weight.unsqueeze(-1) * (
+        hit.unsqueeze(-1) * F.logsigmoid(eta) + (1 - hit.unsqueeze(-1)) * F.logsigmoid(-eta)
+    )
+    total = torch.zeros(t, len(x), dtype=dtype).index_add(0, owner, ll)  # [T, Q]
+    log_prior = _normal_log_pdf(eps, torch.zeros_like(eps), sigma.unsqueeze(-1))
+    log_proposal = _normal_log_pdf(eps, m.unsqueeze(-1), s.unsqueeze(-1))
+    return torch.logsumexp(log_w + total + log_prior - log_proposal, dim=-1)

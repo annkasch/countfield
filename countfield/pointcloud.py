@@ -150,16 +150,17 @@ class PointTransformerLayer(nn.Module):
 
 
 class PointTransformerBlock(nn.Module):
-    def __init__(self, dim: int, pos_dim: int):
+    def __init__(self, dim: int, pos_dim: int, dropout: float = 0.0):
         super().__init__()
         self.norm1, self.norm2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.attention = PointTransformerLayer(dim, pos_dim)
         self.proj = nn.Linear(dim, dim)
         self.ffn = _mlp([dim, 2 * dim, dim])
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, f: torch.Tensor, level: Level) -> torch.Tensor:
-        f = f + self.proj(self.attention(self.norm1(f), level))
-        return f + self.ffn(self.norm2(f))
+        f = f + self.dropout(self.proj(self.attention(self.norm1(f), level)))
+        return f + self.dropout(self.ffn(self.norm2(f)))
 
 
 class TransitionDown(nn.Module):
@@ -186,6 +187,45 @@ class TransitionUp(nn.Module):
         return self.skip(skip) + interpolated
 
 
+class CountEncoder(nn.Module):
+    """Counts-only point feature (ablation): MLP(logit of the smoothed rate, log n)."""
+
+    def __init__(self, out: int):
+        super().__init__()
+        self.mlp = _mlp([2, out, out])
+
+    def forward(self, counts: torch.Tensor) -> torch.Tensor:  # [V, 2] -> [V, out]
+        return self.mlp(counts)
+
+
+class PhotonHead(nn.Module):
+    """Photon-dependent logit offset s(h_j, photon_i) of a point's hit probability."""
+
+    def __init__(self, dim: int, n_photon_features: int, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim + n_photon_features, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(
+        self,
+        h: torch.Tensor,  # [P, C] feature of each photon's point
+        features: torch.Tensor,  # [P, F] standardized photon features
+        chunk: int = 1_000_000,
+    ) -> torch.Tensor:  # [P]
+        return torch.cat(
+            [
+                self.mlp(torch.cat([h[i : i + chunk], features[i : i + chunk]], dim=-1)).squeeze(-1)
+                for i in range(0, len(features), chunk)
+            ]
+        )
+
+
 class PhotonPointTransformer(nn.Module):
     def __init__(
         self,
@@ -195,10 +235,19 @@ class PhotonPointTransformer(nn.Module):
         blocks: int = 1,
         photon_hidden: int = 64,
         min_sigma: float = 1e-3,
+        point_features: str = "photons",
+        photon_head: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.min_sigma = min_sigma
-        self.encoder = PhotonEncoder(n_photon_features, photon_hidden, dims[0])
+        self.point_features = point_features
+        if point_features == "photons":
+            self.encoder = PhotonEncoder(n_photon_features, photon_hidden, dims[0])
+        elif point_features == "counts":
+            self.encoder = CountEncoder(dims[0])
+        else:
+            raise ValueError(f"unknown point_features {point_features!r}")
         self.null = nn.Parameter(torch.zeros(dims[0]))
         self.down_blocks = nn.ModuleList()
         self.downs = nn.ModuleList()
@@ -208,25 +257,31 @@ class PhotonPointTransformer(nn.Module):
             if i:
                 self.downs.append(TransitionDown(dims[i - 1], dim, pos_dim))
             self.down_blocks.append(
-                nn.ModuleList(PointTransformerBlock(dim, pos_dim) for _ in range(blocks))
+                nn.ModuleList(PointTransformerBlock(dim, pos_dim, dropout) for _ in range(blocks))
             )
         for i in range(len(dims) - 1, 0, -1):
             self.ups.append(TransitionUp(dims[i], dims[i - 1]))
             self.up_blocks.append(
-                nn.ModuleList(PointTransformerBlock(dims[i - 1], pos_dim) for _ in range(blocks))
+                nn.ModuleList(
+                    PointTransformerBlock(dims[i - 1], pos_dim, dropout) for _ in range(blocks)
+                )
             )
         self.head = _mlp([dims[0], dims[0], 2])
+        self.photon_head = (
+            PhotonHead(dims[0], n_photon_features, photon_hidden, dropout) if photon_head else None
+        )
 
     def forward(
         self,
         geometry: Geometry,
-        visible: torch.Tensor,  # [V] indices of points whose photons are used
-        photon_args: tuple,  # (features, hit, weight, owner in 0..V-1, n [V], n_scale)
+        visible: torch.Tensor,  # [V] indices of points whose photons (or counts) are used
+        encoder_args: tuple,  # PhotonEncoder or CountEncoder arguments for the visible points
         n_points: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:  # mu [N], sigma [N] (logit offset)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """mu [N], sigma [N] (logit offset from the pooled rate) and point features h [N, C0]."""
         f = self.null.expand(n_points, -1).clone()  # [N, C0]
         if len(visible):
-            f[visible] = self.encoder(*photon_args)
+            f[visible] = self.encoder(*encoder_args)
         levels = geometry.levels
         skips = []
         for i, blocks in enumerate(self.down_blocks):
@@ -241,4 +296,4 @@ class PhotonPointTransformer(nn.Module):
             for block in blocks:
                 f = block(f, levels[i - 1])
         out = self.head(f)  # [N, 2]
-        return out[:, 0], F.softplus(out[:, 1] - 1.0) + self.min_sigma
+        return out[:, 0], F.softplus(out[:, 1] - 1.0) + self.min_sigma, f
