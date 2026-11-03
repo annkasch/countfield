@@ -1,6 +1,8 @@
 """Training, checkpoint selection, prediction and the full run.
 
-Training is leave-one-out: every training point is predicted from its K nearest other
+Model kinds: `local_latent` (here) and `point_transformer` (countfield.train_pt, masked
+training on photon sets). For the local-latent model, training is leave-one-out: every
+training point is predicted from its K nearest other
 training points, so no target sees its own counts and the context density matches
 prediction at a new position. Checkpoints are selected on a held-out share of the observed
 points (predicted from the training points only); evaluation groups are never used for
@@ -99,7 +101,7 @@ def fit(
     for step in range(1, t.steps + 1):
         model.train()
         idx = torch.as_tensor(
-            batches.choice(len(train), min(t.batch_size, len(train)), replace=False)
+            batches.choice(len(train), min(m.batch_size, len(train)), replace=False)
         )
         mu, sigma = model(query[idx], offset[idx], counts[idx])
         loss = -log_marginal(k[idx], n[idx], mu + offset_rate, sigma, m.quadrature_nodes).mean()
@@ -163,7 +165,14 @@ def _git_commit() -> dict:
 def run(config: RunConfig, log=print) -> Path:
     out = config.output_directory
     out.mkdir(parents=True, exist_ok=False)
-    groups = load_groups(config.data.path)
+    point_transformer = config.model.kind == "point_transformer"
+    if point_transformer:
+        from countfield.photons import load_photon_groups
+
+        photon_groups, _ = load_photon_groups(config.data.path)
+        groups = {g: s.counts() for g, s in photon_groups.items()}
+    else:
+        groups = load_groups(config.data.path)
     missing = set(config.data.observations + config.data.evaluation) - set(groups)
     if missing:
         raise KeyError(f"groups not in {config.data.path}: {sorted(missing)}; have {list(groups)}")
@@ -202,21 +211,38 @@ def run(config: RunConfig, log=print) -> Path:
         f"train {len(train)}, holdout {len(holdout)}"
     )
 
-    predictor, history = fit(train, holdout, config, log)
-    (out / "history.json").write_text(json.dumps(history, indent=2))
-    torch.save(
-        dict(
+    if point_transformer:
+        from countfield.photons import PhotonSet, merge_photons_by_position
+        from countfield.train_pt import fit_point_transformer
+
+        photons, _ = merge_photons_by_position(
+            PhotonSet.concatenate([photon_groups[g] for g in config.data.observations]), decimals
+        )
+        if not (np.array_equal(photons.k, observed.k) and np.array_equal(photons.n, observed.n)):
+            raise RuntimeError("merged photon sets disagree with merged counts")
+        history, checkpoint, evaluation_latents = fit_point_transformer(
+            photons,
+            train_idx,
+            holdout_idx,
+            [groups[g].x for g in config.data.evaluation],
+            config,
+            log,
+        )
+        latents = dict(zip(config.data.evaluation, evaluation_latents, strict=True))
+    else:
+        predictor, history = fit(train, holdout, config, log)
+        checkpoint = dict(
             state=predictor.model.state_dict(),
             standardization=predictor.standardization.to_dict(),
-            model=config.model.model_dump(),
-        ),
-        out / "model.pt",
-    )
+        )
+        latents = {g: predictor.latent(observed, groups[g].x) for g in config.data.evaluation}
+    (out / "history.json").write_text(json.dumps(history, indent=2))
+    torch.save(dict(checkpoint, model=config.model.model_dump()), out / "model.pt")
 
     metrics = []
     for g in config.data.evaluation:
         data = groups[g]
-        mu, sigma = predictor.latent(observed, data.x)
+        mu, sigma = latents[g]
         summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
         row = dict(group=g, **score(data, mu, sigma, summary, config.model.quadrature_nodes))
         metrics.append(row)
