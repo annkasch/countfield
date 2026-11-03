@@ -49,7 +49,7 @@ def test_run_end_to_end_beats_constant_rate(tmp_path):
     provenance = json.loads((out / "provenance.json").read_text())
     assert provenance["observed_points"] == 600 and provenance["merged_positions"] == 20
     (row,) = json.loads((out / "metrics.json").read_text())
-    assert set(row["coverage"]) == {"1", "2", "3"}
+    assert set(row["coverage"]) == {"1", "2", "3"} and row["crps"] > 0
     with np.load(out / "evaluation_val_hf.npz") as f:
         k, n = f["hits"], f["target_events"]
         assert np.all(f["latent_sigma"] > 0)

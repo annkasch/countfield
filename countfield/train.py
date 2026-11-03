@@ -217,7 +217,7 @@ def run(config: RunConfig, log=print) -> Path:
     for g in config.data.evaluation:
         data = groups[g]
         mu, sigma = predictor.latent(observed, data.x)
-        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid)
+        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
         row = dict(group=g, **score(data, mu, sigma, summary, config.model.quadrature_nodes))
         metrics.append(row)
         log(f"{g}: NLL {row['predictive_nll']:.4f}, coverage {row['coverage']}")
@@ -236,3 +236,27 @@ def run(config: RunConfig, log=print) -> Path:
 
     plot_run(out)
     return out
+
+
+def rescore(directory: str | Path) -> list[dict]:
+    """Recompute metrics.json and plots of a finished run from its saved latent mu/sigma."""
+    from countfield.config import RunConfig
+    from countfield.plots import plot_run
+
+    directory = Path(directory)
+    config = RunConfig.model_validate_json((directory / "config.json").read_text())
+    metrics = []
+    for g in config.data.evaluation:
+        path = directory / f"evaluation_{g.replace('/', '_')}.npz"
+        with np.load(path) as f:
+            arrays = {key: f[key] for key in f.files}
+        data = CountSet(arrays["x"], arrays["hits"], arrays["target_events"])
+        mu, sigma = arrays["latent_mu"], arrays["latent_sigma"]
+        summary = predictive_summary(mu, sigma, data.n, config.evaluation.latent_grid, k=data.k)
+        metrics.append(
+            dict(group=g, **score(data, mu, sigma, summary, config.model.quadrature_nodes))
+        )
+        np.savez_compressed(path, **{**arrays, **summary})
+    (directory / "metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False))
+    plot_run(directory)
+    return metrics

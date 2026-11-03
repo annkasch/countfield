@@ -1,4 +1,4 @@
-"""python -m countfield train CONFIG.yaml | plot RUN_DIRECTORY"""
+"""python -m countfield train CONFIG.yaml | plot RUN_DIRECTORY | rescore RUN_DIRECTORY"""
 
 import argparse
 
@@ -13,6 +13,10 @@ def main() -> None:
     train.add_argument("config")
     plot = sub.add_parser("plot", help="(re)draw the plots of a finished run")
     plot.add_argument("run_directory")
+    rescore = sub.add_parser(
+        "rescore", help="recompute metrics and plots of a finished run from its saved latents"
+    )
+    rescore.add_argument("run_directory")
     args = parser.parse_args()
     if args.command == "train":
         print(f"output: {run(load_config(args.config))}", flush=True)
@@ -21,6 +25,11 @@ def main() -> None:
 
         for path in plot_run(args.run_directory):
             print(path)
+    elif args.command == "rescore":
+        from countfield.train import rescore as rescore_run
+
+        for row in rescore_run(args.run_directory):
+            print(row["group"], {k: row[k] for k in ("predictive_nll", "crps", "coverage")})
 
 
 if __name__ == "__main__":
