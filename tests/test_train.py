@@ -78,3 +78,9 @@ def test_evaluation_sharing_observed_position_rejected(tmp_path):
     save_groups(config.data.path, groups)
     with pytest.raises(ValueError, match="share a position"):
         run(config, log=lambda *_: None)
+
+
+def test_run_writes_plots(tmp_path):
+    out = run(_config(tmp_path, steps=50), log=lambda *_: None)
+    for name in ("history.png", "coverage_val_hf.png", "zscore_val_hf.png"):
+        assert (out / name).stat().st_size > 0

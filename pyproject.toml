@@ -13,6 +13,7 @@ dependencies = [
     "torch",
     "pydantic>=2",
     "pyyaml",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]

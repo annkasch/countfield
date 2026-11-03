@@ -1,4 +1,4 @@
-"""python -m countfield train CONFIG.yaml"""
+"""python -m countfield train CONFIG.yaml | plot RUN_DIRECTORY"""
 
 import argparse
 
@@ -11,9 +11,16 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     train = sub.add_parser("train", help="train, select on holdout, score evaluation groups")
     train.add_argument("config")
+    plot = sub.add_parser("plot", help="(re)draw the plots of a finished run")
+    plot.add_argument("run_directory")
     args = parser.parse_args()
     if args.command == "train":
         print(f"output: {run(load_config(args.config))}", flush=True)
+    elif args.command == "plot":
+        from countfield.plots import plot_run
+
+        for path in plot_run(args.run_directory):
+            print(path)
 
 
 if __name__ == "__main__":

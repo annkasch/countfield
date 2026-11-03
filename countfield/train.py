@@ -14,6 +14,7 @@ Output directory::
     evaluation_<group>.npz         per evaluation group: counts, latent mu/sigma, predictive
                                    mean/sd and central intervals of k/n
     metrics.json                   one row per evaluation group
+    *.png                          history, coverage and z-score plots (countfield.plots)
 """
 
 from __future__ import annotations
@@ -231,4 +232,7 @@ def run(config: RunConfig, log=print) -> Path:
             **summary,
         )
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False))
+    from countfield.plots import plot_run
+
+    plot_run(out)
     return out
