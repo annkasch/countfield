@@ -17,9 +17,6 @@ import numpy as np  # noqa: E402
 INK, SECONDARY, MUTED = "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS, SURFACE = "#e1e0d9", "#c3c2b7", "#fcfcfb"
 SERIES = ("#2a78d6", "#eb6834")  # categorical slots 1, 2
-BANDS = {3: "#b7d3f6", 2: "#86b6ef", 1: "#5598e7"}  # blue ramp 150 / 250 / 350
-MEAN = "#104281"  # blue 650
-EXPECTED = {1: 68.3, 2: 95.4, 3: 99.7}
 
 
 def _axes(figsize=(7, 4)):
@@ -80,73 +77,117 @@ def plot_history(history: list[dict], path: Path) -> None:
     _finish(fig, ax, path, "Count NLL per point during training", "step", "count NLL")
 
 
-def plot_coverage(arrays: dict, coverage: dict, path: Path, label: str) -> None:
-    order = np.argsort(arrays["mean"])
-    index = np.arange(len(order))
-    fig, ax = _axes((8, 4.5))
-    for level in (3, 2, 1):
-        ax.fill_between(
-            index,
-            arrays[f"lower_{level}"][order],
-            arrays[f"upper_{level}"][order],
-            step="mid",
-            color=BANDS[level],
-            linewidth=0,
-            label=f"{level}σ count interval: {100 * coverage[str(level)]:.1f} % "
-            f"(expected {EXPECTED[level]} %)",
+TARGET = {1: 0.6827, 2: 0.9545, 3: 0.9973}
+# Same layout and colours as the RESUM_FLEX coverage and z-score plots (viz.dispatch,
+# viz.zscore), reimplemented here so both models' plots compare one-to-one.
+BAND_COLORS = {3: ("#d62728", 0.18), 2: ("#ffd700", 0.40), 1: ("#2ca02c", 0.50)}
+
+
+def plot_coverage(arrays: dict, path: Path, label: str) -> dict[int, float]:
+    """Voxels in input order with ±1/2/3σ count intervals and observed k/n; calibration bars."""
+    observed = arrays["observed"]
+    intervals = {k: (arrays[f"lower_{k}"], arrays[f"upper_{k}"]) for k in (1, 2, 3)}
+    coverage = {
+        k: float(((observed >= lo) & (observed <= hi)).mean()) for k, (lo, hi) in intervals.items()
+    }
+    x = np.arange(len(observed))
+    fig, (ax_ts, ax_cal) = plt.subplots(1, 2, figsize=(13, 5), gridspec_kw={"width_ratios": [3, 1]})
+    for k in (3, 2, 1):
+        color, alpha = BAND_COLORS[k]
+        ax_ts.fill_between(
+            x, *intervals[k], color=color, alpha=alpha, label=f"±{k}σ ({coverage[k] * 100:.0f}%)"
         )
-    ax.plot(index, arrays["mean"][order], color=MEAN, linewidth=2, label="predictive mean")
-    ax.scatter(
-        index,
-        arrays["observed"][order],
-        s=9,
-        color=INK,
-        linewidths=0,
-        zorder=3,
-        label="observed fraction k/n",
+    ax_ts.scatter(x, observed, c="black", s=14, alpha=0.85, label="Observed fraction", zorder=4)
+    ax_ts.set_xlabel("Evaluation voxel index")
+    ax_ts.set_ylabel("y")
+    high = max(float(observed.max()), float(intervals[3][1].max()))
+    ax_ts.set_ylim(0, high * 1.05)
+    ax_ts.legend(loc="best", fontsize=9)
+    ax_ts.grid(alpha=0.3)
+
+    pos, w = np.arange(3), 0.38
+    target = [TARGET[k] for k in (1, 2, 3)]
+    actual = [coverage[k] for k in (1, 2, 3)]
+    ax_cal.bar(
+        pos - w / 2, target, w, color="lightgray", edgecolor="black", label="target (Gaussian)"
     )
-    ax.set_ylim(bottom=0)
-    ax.legend(frameon=False, labelcolor=SECONDARY, fontsize=8, loc="upper left")
-    _finish(
-        fig,
-        ax,
-        path,
-        f"{label}: predictive count intervals (as fractions)",
-        "evaluation point, sorted by predictive mean",
-        "hit fraction",
-    )
+    ax_cal.bar(pos + w / 2, actual, w, color="C0", edgecolor="black", label="actual")
+    for p, t_, a_ in zip(pos, target, actual, strict=True):
+        ax_cal.text(p - w / 2, t_ + 0.015, f"{t_ * 100:.1f}%", ha="center", fontsize=8)
+        ax_cal.text(p + w / 2, a_ + 0.015, f"{a_ * 100:.1f}%", ha="center", fontsize=8)
+    ax_cal.set_xticks(pos)
+    ax_cal.set_xticklabels(["1σ", "2σ", "3σ"])
+    ax_cal.set_ylim(0.0, 1.12)
+    ax_cal.set_ylabel("coverage fraction")
+    ax_cal.set_title("calibration")
+    ax_cal.legend(loc="lower right", fontsize=8)
+    ax_cal.grid(alpha=0.3, axis="y")
+    fig.suptitle(f"{label}: countfield observation-predictive coverage")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return coverage
 
 
-def plot_zscores(arrays: dict, path: Path, label: str) -> None:
-    z = (arrays["observed"] - arrays["mean"]) / arrays["sigma"]
-    fig, ax = _axes()
-    edges = np.linspace(-4, 4, 33)
-    ax.hist(
-        np.clip(z, -4, 4),
-        bins=edges,
+def plot_zscores(arrays: dict, path: Path, label: str) -> dict:
+    """z histogram against N(0, 1), and z against the predicted rate with ±1/2/3σ bands.
+
+    Writes PNG and PDF (``path`` without suffix)."""
+    from scipy.stats import norm
+
+    predicted = arrays["mean"]
+    z = (arrays["observed"] - predicted) / arrays["sigma"]
+    summary = dict(
+        mean=float(z.mean()),
+        std=float(z.std(ddof=1)) if len(z) > 1 else 0.0,
+        outside_2=float(np.mean(np.abs(z) > 2)),
+        voxels=len(z),
+    )
+    fig, (ax_hist, ax_rate) = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
+    limit = max(4.0, float(np.ceil(np.abs(z).max())))
+    ax_hist.hist(
+        z,
+        bins=np.linspace(-limit, limit, 41),
         density=True,
-        color=SERIES[0],
-        edgecolor=SURFACE,
-        linewidth=1,
-        label=f"z (mean {z.mean():.2f}, sd {z.std():.2f})",
+        color="C0",
+        alpha=0.6,
+        label=f"{len(z)} voxels",
     )
-    grid = np.linspace(-4, 4, 400)
-    ax.plot(
-        grid,
-        np.exp(-0.5 * grid**2) / np.sqrt(2 * np.pi),
-        color=INK,
-        linewidth=1.5,
-        label="standard normal",
+    grid = np.linspace(-limit, limit, 400)
+    ax_hist.plot(grid, norm.pdf(grid), "k--", label="N(0, 1)")
+    ax_hist.set(
+        xlabel="z = (observed − predicted) / σ",
+        ylabel="Density",
+        title=f"mean {summary['mean']:+.2f}, std {summary['std']:.2f}, "
+        f"|z|>2: {summary['outside_2']:.0%} (4.6% expected)",
     )
-    ax.legend(frameon=False, labelcolor=SECONDARY, fontsize=8)
-    _finish(
-        fig,
-        ax,
-        path,
-        f"{label}: z = (observed − predictive mean) / predictive sd",
-        "z (clipped to ±4)",
-        "density",
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(alpha=0.2)
+    for k, color, alpha in ((3, "#d62728", 0.15), (2, "#ffd700", 0.35), (1, "#2ca02c", 0.35)):
+        inside = np.mean(np.abs(z) <= k)
+        ax_rate.axhspan(
+            -k,
+            k,
+            color=color,
+            alpha=alpha,
+            lw=0,
+            label=f"±{k}σ: {inside:.0%} ({[68.3, 95.4, 99.7][k - 1]}%)",
+        )
+    ax_rate.scatter(predicted, z, s=8, color="black", alpha=0.6, label="voxels", zorder=3)
+    ax_rate.axhline(0, color="black", lw=1)
+    ax_rate.set(
+        xlabel="countfield predicted rate",
+        ylabel="z [σ]",
+        title="z vs predicted rate",
+        ylim=(-limit, limit),
     )
+    ax_rate.legend(fontsize=8)
+    ax_rate.grid(alpha=0.2)
+    fig.suptitle(f"{label}: z = (observed − predictive mean) / predictive sd")
+    for suffix in ("png", "pdf"):
+        fig.savefig(path.with_suffix(f".{suffix}"), dpi=150)
+    plt.close(fig)
+    return summary
 
 
 def plot_run(directory: str | Path) -> list[Path]:
@@ -162,8 +203,8 @@ def plot_run(directory: str | Path) -> list[Path]:
         stem = row["group"].replace("/", "_")
         with np.load(directory / f"evaluation_{stem}.npz") as f:
             arrays = {key: f[key] for key in f.files}
-        written.append(directory / f"coverage_{stem}.png")
-        plot_coverage(arrays, row["coverage"], written[-1], row["group"])
-        written.append(directory / f"zscore_{stem}.png")
-        plot_zscores(arrays, written[-1], row["group"])
+        written.append(directory / f"evaluation_{stem}_coverage.png")
+        plot_coverage(arrays, written[-1], row["group"])
+        plot_zscores(arrays, directory / f"evaluation_{stem}_zscore", row["group"])
+        written += [directory / f"evaluation_{stem}_zscore.{s}" for s in ("png", "pdf")]
     return written
