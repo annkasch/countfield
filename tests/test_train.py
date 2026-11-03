@@ -84,3 +84,15 @@ def test_run_writes_plots(tmp_path):
     out = run(_config(tmp_path, steps=50), log=lambda *_: None)
     for name in ("history.png", "evaluation_val_hf_coverage.png", "evaluation_val_hf_zscore.png"):
         assert (out / name).stat().st_size > 0
+
+
+def test_zscore_plot_fixed_range_counts_outliers(tmp_path):
+    from countfield.plots import plot_zscores
+
+    arrays = {
+        "mean": np.full(5, 1e-3),
+        "sigma": np.full(5, 1e-4),
+        "observed": 1e-3 + 1e-4 * np.array([0.0, 1.0, -2.0, 8.0, -9.0]),
+    }
+    summary = plot_zscores(arrays, tmp_path / "z", "test")
+    assert (tmp_path / "z.png").stat().st_size > 0 and summary["voxels"] == 5
