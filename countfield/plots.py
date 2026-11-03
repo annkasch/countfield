@@ -83,7 +83,9 @@ TARGET = {1: 0.6827, 2: 0.9545, 3: 0.9973}
 BAND_COLORS = {3: ("#d62728", 0.18), 2: ("#ffd700", 0.40), 1: ("#2ca02c", 0.50)}
 
 
-def plot_coverage(arrays: dict, path: Path, label: str) -> dict[int, float]:
+def plot_coverage(
+    arrays: dict, path: Path, label: str, ylim: tuple[float, float] | None = None
+) -> dict[int, float]:
     """Voxels in input order with ±1/2/3σ count intervals and observed k/n; calibration bars."""
     observed = arrays["observed"]
     intervals = {k: (arrays[f"lower_{k}"], arrays[f"upper_{k}"]) for k in (1, 2, 3)}
@@ -101,7 +103,7 @@ def plot_coverage(arrays: dict, path: Path, label: str) -> dict[int, float]:
     ax_ts.set_xlabel("Evaluation voxel index")
     ax_ts.set_ylabel("y")
     high = max(float(observed.max()), float(intervals[3][1].max()))
-    ax_ts.set_ylim(0, high * 1.05)
+    ax_ts.set_ylim(*(ylim if ylim else (0, high * 1.05)))
     ax_ts.legend(loc="best", fontsize=9)
     ax_ts.grid(alpha=0.3)
 
@@ -195,9 +197,13 @@ def plot_zscores(arrays: dict, path: Path, label: str, limit: float = Z_LIMIT) -
     return summary
 
 
-def plot_run(directory: str | Path) -> list[Path]:
+def plot_run(directory: str | Path, coverage_ylim: tuple[float, float] | None = None) -> list[Path]:
+    """All plots of a run; coverage_ylim None reads evaluation.coverage_ylim from config.json."""
     directory = Path(directory)
     written = []
+    if coverage_ylim is None and (directory / "config.json").is_file():
+        saved = json.loads((directory / "config.json").read_text())
+        coverage_ylim = saved.get("evaluation", {}).get("coverage_ylim")
     history = directory / "history.json"
     if history.is_file():
         written.append(directory / "history.png")
@@ -209,7 +215,7 @@ def plot_run(directory: str | Path) -> list[Path]:
         with np.load(directory / f"evaluation_{stem}.npz") as f:
             arrays = {key: f[key] for key in f.files}
         written.append(directory / f"evaluation_{stem}_coverage.png")
-        plot_coverage(arrays, written[-1], row["group"])
+        plot_coverage(arrays, written[-1], row["group"], coverage_ylim)
         plot_zscores(arrays, directory / f"evaluation_{stem}_zscore", row["group"])
         written += [directory / f"evaluation_{stem}_zscore.{s}" for s in ("png", "pdf")]
     return written

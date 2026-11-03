@@ -13,6 +13,7 @@ def main() -> None:
     train.add_argument("config")
     plot = sub.add_parser("plot", help="(re)draw the plots of a finished run")
     plot.add_argument("run_directory")
+    plot.add_argument("--coverage-ylim", type=float, nargs=2, metavar=("LOW", "HIGH"))
     rescore = sub.add_parser(
         "rescore", help="recompute metrics and plots of a finished run from its saved latents"
     )
@@ -23,7 +24,7 @@ def main() -> None:
     elif args.command == "plot":
         from countfield.plots import plot_run
 
-        for path in plot_run(args.run_directory):
+        for path in plot_run(args.run_directory, args.coverage_ylim):
             print(path)
     elif args.command == "rescore":
         from countfield.train import rescore as rescore_run

@@ -96,3 +96,20 @@ def test_zscore_plot_fixed_range_counts_outliers(tmp_path):
     }
     summary = plot_zscores(arrays, tmp_path / "z", "test")
     assert (tmp_path / "z.png").stat().st_size > 0 and summary["voxels"] == 5
+
+
+def test_coverage_ylim_config_and_plot(tmp_path):
+    import pytest
+    from pydantic import ValidationError
+
+    from countfield.config import EvaluationConfig
+    from countfield.plots import plot_coverage
+
+    assert EvaluationConfig(coverage_ylim=(0, 0.0065)).coverage_ylim == (0, 0.0065)
+    with pytest.raises(ValidationError, match="coverage_ylim"):
+        EvaluationConfig(coverage_ylim=(1, 0))
+    arrays = {"observed": np.array([1e-3, 2e-3])}
+    for k in (1, 2, 3):
+        arrays[f"lower_{k}"], arrays[f"upper_{k}"] = np.zeros(2), np.full(2, 3e-3)
+    plot_coverage(arrays, tmp_path / "c.png", "t", ylim=(0, 0.0065))
+    assert (tmp_path / "c.png").stat().st_size > 0

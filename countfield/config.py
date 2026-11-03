@@ -92,6 +92,15 @@ class TrainingConfig(_Strict):
 
 class EvaluationConfig(_Strict):
     latent_grid: int = Field(2048, ge=16, description="latent quantiles for predictive pmfs")
+    coverage_ylim: tuple[float, float] | None = Field(
+        None, description="fixed y range of the coverage plots (k/n); null = from the data"
+    )
+
+    @model_validator(mode="after")
+    def _ordered_ylim(self) -> EvaluationConfig:
+        if self.coverage_ylim is not None and not self.coverage_ylim[0] < self.coverage_ylim[1]:
+            raise ValueError(f"coverage_ylim must be (low, high), got {self.coverage_ylim}")
+        return self
 
 
 class RunConfig(_Strict):
