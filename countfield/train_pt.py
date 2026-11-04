@@ -34,6 +34,7 @@ from countfield.config import PointTransformerConfig, RunConfig
 from countfield.likelihood import log_marginal, photon_log_marginal
 from countfield.photons import PhotonSet
 from countfield.pointcloud import Geometry, PhotonPointTransformer
+from countfield.resume import load_state, save_state
 from countfield.scoring import grid_log_mass
 
 
@@ -198,8 +199,12 @@ def fit_point_transformer(
     evaluation_x: list[np.ndarray],
     config: RunConfig,
     log=print,
+    resume=None,
 ):
     """Train, select on holdout; returns (history, checkpoint dict, predictions per eval set).
+
+    ``resume``: checkpoint file written at every evaluation step; an existing one continues
+    the run from its step.
 
     Predictions are (mu, sigma) arrays (voxel loss) or a [Q, G] probability grid (photon loss).
     """
@@ -255,7 +260,14 @@ def fit_point_transformer(
         return float(value), spread
 
     history, best, best_nll, running = [], None, np.inf, []
-    for step in range(1, t.steps + 1):
+    streams = dict(masks=masks, photons=photons)
+    state = load_state(resume, model, optimizer, streams)
+    start = 1
+    if state is not None:
+        history, best, best_nll = state["history"], state["best"], state["best_nll"]
+        start = state["step"] + 1
+        log(f"resuming after step {state['step']}")
+    for step in range(start, t.steps + 1):
         model.train()
         keep = cloud.train_idx
         if thinning:
@@ -299,6 +311,16 @@ def fit_point_transformer(
             if nll < best_nll:
                 best_nll, best = nll, dict(step=step, state=copy.deepcopy(model.state_dict()))
             log(f"step {step}: train {history[-1]['train_loss']:.4f} holdout {nll:.4f}")
+            save_state(
+                resume,
+                step,
+                model,
+                optimizer,
+                streams,
+                history=history,
+                best=best,
+                best_nll=best_nll,
+            )
     model.load_state_dict(best["state"])
     history.append(dict(selected_step=best["step"], selected_holdout_nll=best_nll))
 

@@ -21,4 +21,6 @@ threads=${TORCH_THREADS:-8}
 export OMP_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=$threads
 python=${COUNTFIELD_PYTHON:-.venv/bin/python}
 echo "host $(hostname), threads $threads, config $config, commit $(git rev-parse --short HEAD)"
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$python" -m countfield train "$config"
+# -u: progress lines appear in the log as they happen. Resubmitting the same config after a
+# cancel or time limit resumes from the last evaluation step (countfield.resume).
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$python" -u -m countfield train "$config"

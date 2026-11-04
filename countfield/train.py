@@ -39,6 +39,7 @@ from countfield.data import (
 )
 from countfield.likelihood import log_marginal
 from countfield.model import LocalLatentNP, NeighbourInputs, Standardization
+from countfield.resume import load_state, save_state
 from countfield.scoring import grid_log_mass, predictive_summary, predictive_summary_grid, score
 
 
@@ -77,9 +78,13 @@ class Predictor:
 
 
 def fit(
-    train: CountSet, holdout: CountSet, config: RunConfig, log=print
+    train: CountSet, holdout: CountSet, config: RunConfig, log=print, resume: Path | None = None
 ) -> tuple[Predictor, list[dict]]:
-    """Train on `train` (leave-one-out), select the step with the lowest holdout count NLL."""
+    """Train on `train` (leave-one-out), select the step with the lowest holdout count NLL.
+
+    ``resume``: checkpoint file written at every evaluation step; an existing one continues
+    the run from its step.
+    """
     m, t = config.model, config.training
     standardization = Standardization.fit(train)
     torch.manual_seed(int(_stream(t.seed, 1).integers(2**31)))
@@ -98,7 +103,18 @@ def fit(
     batches = _stream(t.seed, 2)
     history, best, best_nll = [], None, np.inf
     running = []
-    for step in range(1, t.steps + 1):
+    streams = dict(batches=batches)
+    state = load_state(resume, model, optimizer, streams)
+    start = 1
+    if state is not None:
+        history, best, best_nll, start = (
+            state["history"],
+            state["best"],
+            state["best_nll"],
+            (state["step"] + 1),
+        )
+        log(f"resuming after step {state['step']}")
+    for step in range(start, t.steps + 1):
         model.train()
         idx = torch.as_tensor(
             batches.choice(len(train), min(m.batch_size, len(train)), replace=False)
@@ -135,6 +151,16 @@ def fit(
             if nll < best_nll:
                 best_nll, best = nll, dict(step=step, state=copy.deepcopy(model.state_dict()))
             log(f"step {step}: train {history[-1]['train_nll']:.4f} holdout {nll:.4f}")
+            save_state(
+                resume,
+                step,
+                model,
+                optimizer,
+                streams,
+                history=history,
+                best=best,
+                best_nll=best_nll,
+            )
     model.load_state_dict(best["state"])
     history.append(dict(selected_step=best["step"], selected_holdout_nll=best_nll))
     return predictor, history
@@ -163,8 +189,22 @@ def _git_commit() -> dict:
 
 
 def run(config: RunConfig, log=print) -> Path:
+    """Train, score and plot one configured run into ``config.output_directory``.
+
+    An existing directory is accepted only for the same config and an unfinished run: with a
+    training checkpoint (``resume.pt``) the run continues from it, otherwise it restarts.
+    """
     out = config.output_directory
-    out.mkdir(parents=True, exist_ok=False)
+    resume = out / "resume.pt"
+    if out.exists():
+        saved = out / "config.json"
+        if not saved.exists() or saved.read_text() != config.model_dump_json(indent=2):
+            raise FileExistsError(f"{out} exists and holds a different (or no) run config")
+        if (out / "model.pt").exists():
+            raise FileExistsError(f"{out} holds a finished run; choose a new output_directory")
+        log(f"continuing unfinished run in {out}" + ("" if resume.exists() else " from step 0"))
+    else:
+        out.mkdir(parents=True)
     point_transformer = config.model.kind == "point_transformer"
     if point_transformer:
         from countfield.photons import load_photon_groups
@@ -227,10 +267,11 @@ def run(config: RunConfig, log=print) -> Path:
             [groups[g].x for g in config.data.evaluation],
             config,
             log,
+            resume=resume,
         )
         latents = dict(zip(config.data.evaluation, evaluation_latents, strict=True))
     else:
-        predictor, history = fit(train, holdout, config, log)
+        predictor, history = fit(train, holdout, config, log, resume=resume)
         checkpoint = dict(
             state=predictor.model.state_dict(),
             standardization=predictor.standardization.to_dict(),
@@ -258,6 +299,7 @@ def run(config: RunConfig, log=print) -> Path:
     from countfield.plots import plot_run
 
     plot_run(out)
+    resume.unlink(missing_ok=True)  # finished: the training checkpoint is no longer needed
     return out
 
 
