@@ -241,3 +241,79 @@ def test_regularized_variants_run_end_to_end(tmp_path, model_extra):
     (again,) = rescore(out)
     assert again["predictive_nll"] == pytest.approx(row["predictive_nll"])
     assert (out / "history.png").stat().st_size > 0
+
+
+@pytest.mark.parametrize("features", ["photons", "counts"])
+def test_jitter_and_photon_thinning_keep_masked_points_hidden(features):
+    config = _pt_config(point_features=features, position_jitter=0.3, photon_keep_min=0.5)
+    data = sample_photons(60, 120, seed=11)
+    cloud = PhotonCloud(data, np.arange(60), [], config.model)
+    torch.manual_seed(0)
+    model = PhotonPointTransformer(6, 3, [16, 32], 1, 16, point_features=features).eval()
+    visible = np.arange(10, 60)  # 0..9 masked
+
+    def run(seed):
+        rng, augment = np.random.default_rng(0), np.random.default_rng(seed)
+        with torch.no_grad():
+            return cloud.forward(model, None, visible, 32, rng, augment)
+
+    first = run(1)
+    cloud.features[cloud.owner < 10] += 3.0
+    cloud.hit[cloud.owner < 10] = 1 - cloud.hit[cloud.owner < 10]
+    cloud.k[:10] = cloud.n[:10] // 2
+    for a, b in zip(first, run(1), strict=True):
+        torch.testing.assert_close(a, b)
+    assert not torch.allclose(first[0], run(2)[0])  # the augmentation changes every pass
+
+
+def test_photon_thinning_keeps_the_expected_share():
+    config = _pt_config(photon_keep_min=0.4)
+    data = sample_photons(4, 2000, seed=12)
+    cloud = PhotonCloud(data, np.arange(4), [], config.model)
+    keep = np.array([0.4, 0.6, 0.8, 1.0])
+    for misses in (None, 64):
+        draws = [
+            cloud.sample_rows(
+                np.arange(4), misses, np.random.default_rng(s), keep, np.random.default_rng(100 + s)
+            )
+            for s in range(300)
+        ]
+        n = np.mean([d[3] for d in draws], axis=0)
+        np.testing.assert_allclose(n, keep * cloud.n, rtol=0.02)
+        weight_sum = np.mean(
+            [np.bincount(d[2].numpy(), d[1].numpy(), minlength=4) for d in draws], axis=0
+        )
+        np.testing.assert_allclose(weight_sum, n, rtol=1e-6)
+
+
+def test_augmented_run_end_to_end(tmp_path):
+    from countfield.train import run
+
+    torch.set_num_threads(1)
+    save_photon_groups(
+        tmp_path / "photons.npz",
+        {"obs": sample_photons(120, 400, seed=13), "val": sample_photons(20, 400, seed=14)},
+    )
+    path = tmp_path / "run.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "data": {"path": "photons.npz", "observations": ["obs"], "evaluation": ["val"]},
+                "model": {
+                    "kind": "point_transformer",
+                    "dims": [16, 32],
+                    "neighbours": 8,
+                    "photon_hidden": 16,
+                    "misses_per_point": 32,
+                    "position_jitter": 0.3,
+                    "photon_keep_min": 0.5,
+                },
+                "training": {"steps": 4, "eval_every": 2},
+                "evaluation": {"latent_grid": 64},
+                "output_directory": "out",
+            }
+        )
+    )
+    out = run(load_config(path), log=lambda *_: None)
+    (row,) = json.loads((out / "metrics.json").read_text())
+    assert np.isfinite(row["predictive_nll"])

@@ -17,7 +17,12 @@ Losses (`loss`):
   the query's own simulation enters.
 
 Regularization: graph thinning (each step keeps a random share of the training points and
-rebuilds the neighbourhoods), a random masked share, dropout and weight decay.
+rebuilds the neighbourhoods), position jitter (each step moves every point by a Gaussian
+offset of a fraction of the point spacing and rebuilds the neighbourhoods), photon thinning
+(each step every visible point keeps a random share of its photons, so its counts and hits
+change), a random masked share, dropout and weight decay. Jitter and photon thinning target
+memorisation: without them a training point is identified by its fixed neighbour offsets and
+neighbour data, and the network learns its count instead of the field.
 Checkpoints are selected on the holdout count NLL with all training points visible; the final
 prediction of the evaluation points uses all observed points as visible.
 """
@@ -28,6 +33,7 @@ import copy
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 from scipy.stats import norm
 
 from countfield.config import PointTransformerConfig, RunConfig
@@ -61,6 +67,12 @@ class PhotonCloud:
         self.z = (x - self.x_mean) / self.x_scale  # [N, D] all points
         self.n_points = len(x)
         self._full = None
+        z_train = self.z[np.sort(train_idx)]
+        self.spacing = (
+            float(np.median(cKDTree(z_train).query(z_train, k=2)[0][:, 1]))
+            if len(z_train) > 1
+            else 1.0
+        )
         self.train_idx = np.sort(train_idx)
 
         owner = observed.point  # [P]
@@ -76,13 +88,7 @@ class PhotonCloud:
         self.n_scale = float(np.median(observed.n[train_idx]))
         rate = observed.k[train_idx].sum() / observed.n[train_idx].sum()
         self.logit_rate = float(np.log(rate / (1 - rate)))
-        smoothed = (self.k + 0.5) / (self.n + 1.0)
-        self.count_features = torch.as_tensor(
-            np.column_stack(
-                [np.log(smoothed / (1 - smoothed)) - self.logit_rate, np.log(self.n / self.n_scale)]
-            ),
-            dtype=torch.float32,
-        )
+        self.count_features = self._count_features(self.k, self.n)
         # Hits and misses grouped by point (rows into the photon arrays).
         hit_rows = np.flatnonzero(observed.hit == 1)
         self.hit_rows, self.hit_owner = hit_rows, owner[hit_rows]
@@ -99,24 +105,57 @@ class PhotonCloud:
             self._full = self.geometry(np.arange(self.n_points))
         return self._full
 
-    def geometry(self, points: np.ndarray) -> Geometry:
+    def geometry(self, points: np.ndarray, rng: np.random.Generator | None = None) -> Geometry:
+        """Geometry of `points`; with `rng`, positions jittered by position_jitter * spacing."""
         m = self.m
-        return Geometry(self.z[points], len(m.dims), m.neighbours, m.downsample_ratio)
+        z = self.z[points]
+        if rng is not None and m.position_jitter > 0:
+            z = z + rng.normal(0.0, m.position_jitter * self.spacing, z.shape)
+        return Geometry(z, len(m.dims), m.neighbours, m.downsample_ratio)
+
+    def _count_features(self, k: np.ndarray, n: np.ndarray) -> torch.Tensor:  # [V, 2]
+        smoothed = (k + 0.5) / (n + 1.0)
+        return torch.as_tensor(
+            np.column_stack(
+                [np.log(smoothed / (1 - smoothed)) - self.logit_rate, np.log(n / self.n_scale)]
+            ),
+            dtype=torch.float32,
+        )
 
     # --- photons ----------------------------------------------------------------------------
-    def sample_rows(self, points: np.ndarray, misses: int | None, rng: np.random.Generator):
-        """All hits + sampled (or all) misses of `points`: rows, weights, owner (0..len-1)."""
+    def sample_rows(
+        self,
+        points: np.ndarray,
+        misses: int | None,
+        rng: np.random.Generator,
+        keep: np.ndarray | None = None,
+        thin_rng: np.random.Generator | None = None,
+    ):
+        """All hits + sampled (or all) misses of `points`: rows, weights, owner (0..len-1).
+
+        With `keep` [len(points)], each photon of a point first survives with that probability
+        (binomial thinning, draws from `thin_rng`); sampled misses then stand for the surviving
+        misses. Returns rows, weights, owner and the surviving photons per point [len(points)].
+        """
         local = np.full(self.n_observed, -1, dtype=np.int64)
         local[points] = np.arange(len(points))
         hits = self.hit_rows[local[self.hit_owner] >= 0]
+        count = self.miss_count[points]  # [V]
+        if keep is not None:
+            hits = hits[thin_rng.random(len(hits)) < keep[local[self.owner[hits]]]]
         if misses is None:
             miss = self.miss_rows[local[self.owner[self.miss_rows]] >= 0]
+            if keep is not None:
+                miss = miss[thin_rng.random(len(miss)) < keep[local[self.owner[miss]]]]
+                count = np.bincount(local[self.owner[miss]], minlength=len(points))
             miss_weight = np.ones(len(miss))
         else:
-            count = self.miss_count[points]  # [V]
+            total = count
+            if keep is not None:  # surviving misses; the sample is drawn from all of them
+                count = thin_rng.binomial(total, keep)
             u = rng.random((len(points), misses))
             pick = np.minimum(
-                (u * count[:, None]).astype(np.int64), np.maximum(count - 1, 0)[:, None]
+                (u * total[:, None]).astype(np.int64), np.maximum(total - 1, 0)[:, None]
             )
             miss = self.miss_rows[(self.miss_start[points][:, None] + pick)[count > 0].ravel()]
             miss_weight = np.repeat(count[count > 0] / misses, misses)
@@ -124,18 +163,36 @@ class PhotonCloud:
         weight = torch.as_tensor(
             np.concatenate([np.ones(len(hits)), miss_weight]), dtype=torch.float32
         )
-        return rows, weight, torch.as_tensor(local[self.owner[rows]])
+        owner = local[self.owner[rows]]
+        n = np.bincount(owner[: len(hits)], minlength=len(points)) + count
+        return rows, weight, torch.as_tensor(owner), n
 
-    def encoder_args(self, visible: np.ndarray, misses: int | None, rng: np.random.Generator):
-        if self.m.point_features == "counts":
-            return (self.count_features[visible],)
-        rows, weight, owner = self.sample_rows(visible, misses, rng)
+    def encoder_args(
+        self,
+        visible: np.ndarray,
+        misses: int | None,
+        rng: np.random.Generator,
+        thin_rng: np.random.Generator | None = None,
+    ):
+        """Encoder inputs of the visible points; with `thin_rng`, photon thinning
+        (photon_keep_min) for this pass."""
+        m = self.m
+        keep = None
+        if thin_rng is not None and m.photon_keep_min < 1:
+            keep = thin_rng.uniform(m.photon_keep_min, 1.0, len(visible))
+        if m.point_features == "counts":
+            if keep is None:
+                return (self.count_features[visible],)
+            k = thin_rng.binomial(self.k[visible], keep)
+            n = k + thin_rng.binomial(self.n[visible] - self.k[visible], keep)
+            return (self._count_features(k, np.maximum(n, 1)),)
+        rows, weight, owner, n = self.sample_rows(visible, misses, rng, keep, thin_rng)
         return (
             self.features[rows],
             self.hit[rows],
             weight,
             owner,
-            torch.as_tensor(self.n[visible], dtype=torch.float32),
+            torch.as_tensor(np.maximum(n, 1), dtype=torch.float32),
             self.n_scale,
         )
 
@@ -149,17 +206,29 @@ class PhotonCloud:
         return start[:, None] + pick
 
     # --- model passes -----------------------------------------------------------------------
-    def forward(self, model, points: np.ndarray | None, visible: np.ndarray, misses, rng):
-        """mu (absolute logit), sigma, h on `points` (None = full cloud) with `visible` used."""
-        if points is None:
+    def forward(
+        self,
+        model,
+        points: np.ndarray | None,
+        visible: np.ndarray,
+        misses,
+        rng,
+        augment: np.random.Generator | None = None,
+    ):
+        """mu (absolute logit), sigma, h on `points` (None = full cloud) with `visible` used.
+
+        `augment` (training passes): random stream for position jitter and photon thinning."""
+        jitter = augment is not None and self.m.position_jitter > 0
+        if points is None and not jitter:
             geometry, local, size = self.full_geometry, visible, self.n_points
         else:
+            points = np.arange(self.n_points) if points is None else points
             index = np.full(self.n_points, -1, dtype=np.int64)
             index[points] = np.arange(len(points))
-            geometry, local, size = self.geometry(points), index[visible], len(points)
-        mu, sigma, h = model(
-            geometry, torch.as_tensor(local), self.encoder_args(visible, misses, rng), size
-        )
+            geometry = self.geometry(points, augment if jitter else None)
+            local, size = index[visible], len(points)
+        args = self.encoder_args(visible, misses, rng, augment)
+        mu, sigma, h = model(geometry, torch.as_tensor(local), args, size)
         return mu + self.logit_rate, sigma, h
 
     def voxel_nll(self, mu, sigma, points_global, at, nodes):
@@ -168,7 +237,7 @@ class PhotonCloud:
         return -log_marginal(k, n, mu[at], sigma[at], nodes)
 
     def photon_nll(self, model, mu, sigma, h, points_global, at, misses, rng, nodes):
-        rows, weight, owner = self.sample_rows(points_global, misses, rng)
+        rows, weight, owner, _ = self.sample_rows(points_global, misses, rng)
         at = torch.as_tensor(at)
         base = mu[at][owner] + model.photon_head(h[at][owner], self.features[rows])
         return -photon_log_marginal(base, self.hit[rows], weight, owner, sigma[at], nodes)
@@ -221,6 +290,7 @@ def fit_point_transformer(
         model.parameters(), lr=t.learning_rate, weight_decay=t.weight_decay
     )
     masks, photons = _stream(t.seed, 2), _stream(t.seed, 3)
+    augment = _stream(t.seed, 8) if m.position_jitter > 0 or m.photon_keep_min < 1 else None
     thinning = m.keep_fraction_min < 1
     selection_grid = min(256, config.evaluation.latent_grid)
 
@@ -272,7 +342,7 @@ def fit_point_transformer(
         n_mask = min(len(keep) - 1, max(1, round(fraction * len(keep))))
         target, visible = np.sort(order[:n_mask]), np.sort(order[n_mask:])
         mu, sigma, h = cloud.forward(
-            model, keep if thinning else None, visible, m.misses_per_point, photons
+            model, keep if thinning else None, visible, m.misses_per_point, photons, augment
         )
         at = np.searchsorted(keep, target) if thinning else target
         if photon:

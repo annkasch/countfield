@@ -102,6 +102,22 @@ class PointTransformerConfig(_Strict):
         "in [keep_fraction_min, 1] of the training points and rebuilds the neighbourhoods",
     )
 
+    position_jitter: float = Field(
+        0.0,
+        ge=0,
+        description="per training step, Gaussian jitter of every position with this sd in "
+        "units of the median nearest-neighbour distance of the training points (graph rebuilt; "
+        "breaks memorisation of a point by its exact neighbour offsets); 0 = off",
+    )
+    photon_keep_min: float = Field(
+        1.0,
+        gt=0,
+        le=1,
+        description="per training step, every visible point keeps each of its photons (hits "
+        "and misses) with a probability uniform in [photon_keep_min, 1] (binomial thinning: "
+        "the visible counts and hits change every step); 1 = off",
+    )
+
     @model_validator(mode="after")
     def _mask_range(self) -> PointTransformerConfig:
         if self.mask_fraction_max is not None and self.mask_fraction_max < self.mask_fraction:
